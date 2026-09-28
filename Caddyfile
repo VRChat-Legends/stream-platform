@@ -1,0 +1,14 @@
+watch.vrchatlegends.com, studio.vrchatlegends.com, stream.vrchatlegends.com {
+    @internal path /internal/*
+    respond @internal 404
+    handle /live/* {
+        header Access-Control-Allow-Origin "*"
+        header Cache-Control "no-store"
+        reverse_proxy mediamtx:8888
+    }
+    handle {
+        reverse_proxy backend:3000 {
+            flush_interval -1
+        }
+    }
+}

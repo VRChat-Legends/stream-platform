@@ -1,0 +1,29 @@
+import type {FastifyInstance} from 'fastify';
+import {z} from 'zod';
+import {db,get,put,log} from './store.js';
+
+const token=process.env.DISCORD_BOT_TOKEN;
+let bot:any=null,lastError='',connected=false,channelName='',guildName='';
+let socket:WebSocket|undefined,heartbeat:NodeJS.Timeout|undefined,sequence:number|null=null,ack=true;
+async function discord(path:string,method='GET',body?:unknown){const r=await fetch('https://discord.com/api/v10/'+path,{method,headers:{Authorization:'Bot '+token,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(12000)});if(!r.ok)throw new Error('Discord returned HTTP '+r.status+'. Check the bot token and channel permissions.');return r.status===204?{}:r.json() as Promise<any>;}
+const channel=()=>get('discordChannel')||'';
+export async function registerDiscord(app:FastifyInstance,adminAuth:any,status:()=>any){
+ function snapshot(){const s=status();return {title:'VRChat Legends · Stream status',color:s.live?0x36c98f:0x7c5cff,fields:[{name:'Main stream',value:s.live?'Live':'Fallback',inline:true},{name:'HLS sessions',value:String(s.viewers),inline:true},{name:'Program',value:s.pipelineReady?'Healthy':'Recovering',inline:true},{name:'Chat messages',value:String((db.prepare('SELECT COUNT(*) AS n FROM chat_messages').get() as any).n),inline:true},{name:'Watch',value:s.urls.watch}],timestamp:new Date().toISOString(),footer:{text:'Counts describe stream activity. Private keys and chat text are excluded.'}};}
+ async function send(embeds:any[]){if(!channel())return;await discord('channels/'+channel()+'/messages','POST',{embeds,allowed_mentions:{parse:[]}});put('discordLastSent',new Date().toISOString());lastError='';}
+ async function connect(){if(!token)return;try{bot=await discord('users/@me');const gateway=await discord('gateway/bot');socket=new WebSocket(gateway.url+'/?v=10&encoding=json');
+  socket.onmessage=event=>{let d:any;try{d=JSON.parse(String(event.data))}catch{return;}if(d.s!==null&&d.s!==undefined)sequence=d.s;
+   if(d.op===10){ack=true;const beat=()=>{if(!ack){socket?.close();return;}ack=false;socket?.send(JSON.stringify({op:1,d:sequence}))};heartbeat=setInterval(beat,d.d.heartbeat_interval);socket?.send(JSON.stringify({op:2,d:{token,intents:1,properties:{os:'linux',browser:'Legends Studio',device:'Legends Studio'},presence:{status:'online',afk:false,activities:[{name:'VRChat Legends streams',type:3}],since:null}}}));}
+   if(d.op===11)ack=true;if(d.op===1){socket?.send(JSON.stringify({op:1,d:sequence}));}if(d.op===7||d.op===9)socket?.close();
+   if(d.t==='READY'){connected=true;lastError='';}
+   if(d.t==='INTERACTION_CREATE'&&d.d.data?.name==='streamstatus'){void discord('interactions/'+d.d.id+'/'+d.d.token+'/callback','POST',{type:4,data:{embeds:[snapshot()],flags:64,allowed_mentions:{parse:[]}}}).catch(()=>{});}
+  };socket.onclose=()=>{connected=false;if(heartbeat)clearInterval(heartbeat);setTimeout(()=>void connect(),60000).unref()};socket.onerror=()=>{lastError='Discord gateway connection interrupted.';socket?.close()};
+  await discord('applications/'+bot.id+'/commands','POST',{name:'streamstatus',description:'Show VRChat Legends stream health and activity',type:1});
+ }catch(e){lastError=(e as Error).message;setTimeout(()=>void connect(),60000).unref();}}
+ app.get('/api/admin/discord',{preHandler:adminAuth},async()=>({configured:!!token,connected,bot:bot?{id:bot.id,name:bot.username}:null,channel:channel(),channelName,guildName,lastError,lastSent:get('discordLastSent'),invite:bot?'https://discord.com/oauth2/authorize?client_id='+bot.id+'&scope=bot%20applications.commands&permissions=19456':'',callback:'https://'+(process.env.WATCH_HOST||'watch.vrchatlegends.com')+'/auth/callback'}));
+ app.get('/api/admin/discord/guilds',{preHandler:adminAuth},async()=>token?(await discord('users/@me/guilds')).map((g:any)=>({id:g.id,name:g.name})):[]);
+ app.get('/api/admin/discord/guilds/:id/channels',{preHandler:adminAuth},async req=>{const id=z.string().regex(/^\d{16,22}$/).parse((req.params as any).id);return (await discord('guilds/'+id+'/channels')).filter((c:any)=>c.type===0||c.type===5).map((c:any)=>({id:c.id,name:c.name}));});
+ app.put('/api/admin/discord',{preHandler:adminAuth},async req=>{const b=z.object({channel:z.string().regex(/^$|^\d{16,22}$/)}).parse(req.body);if(b.channel){const c=await discord('channels/'+b.channel);if(![0,5].includes(c.type))throw Object.assign(new Error('Choose a text or announcement channel.'),{statusCode:400});channelName=c.name;const g=await discord('guilds/'+c.guild_id);guildName=g.name;}put('discordChannel',b.channel);put('discordCursor',(db.prepare('SELECT MAX(id) AS id FROM logs').get() as any).id||0);log('Discord channel updated');return {ok:true};});
+ app.post('/api/admin/discord/test',{preHandler:adminAuth},async()=>{if(!channel())throw Object.assign(new Error('Choose a Discord channel first.'),{statusCode:400});await send([snapshot()]);return {ok:true};});
+ let sending=false,lastSummary=Date.now();setInterval(()=>{void(async()=>{if(!channel()||!bot||sending)return;sending=true;try{const cursor=get('discordCursor')||0;const events=db.prepare('SELECT * FROM logs WHERE id>? ORDER BY id LIMIT 100').all(cursor) as any[];const visible=events.filter(e=>/^(Publisher connected|Publisher disconnected|Program |Fallback video updated|Media server restart)/.test(e.event));if(visible.length)await send([{title:'Broadcast activity',color:0x7c5cff,description:visible.slice(-12).map(e=>'**'+e.event+'**').join('\n').slice(0,3500),timestamp:new Date().toISOString()}]);if(events.length)put('discordCursor',events.at(-1).id);if(Date.now()-lastSummary>600000){await send([snapshot()]);lastSummary=Date.now()}}catch(e){lastError=(e as Error).message}finally{sending=false}})()},10000).unref();
+ void connect();
+}
